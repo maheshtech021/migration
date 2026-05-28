@@ -1,0 +1,6 @@
+# Local secrets for `wrangler dev`
+# Copy to .dev.vars (gitignored) and fill in values.
+# In production set these with: wrangler secret put <NAME>
+
+JWT_SECRET=dev-secret-change-in-production
+ALLOWED_ORIGIN=http://localhost:8787

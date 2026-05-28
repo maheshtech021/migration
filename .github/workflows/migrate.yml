@@ -1,0 +1,141 @@
+name: Migrate
+
+# Runs D1 migrations against dev or qa database.
+# Called automatically from deploy.yml before every deployment.
+# Can also be triggered manually to run migrations without redeploying.
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: Target environment (dev or qa)
+        required: true
+        type: string
+      migration_file:
+        description: Specific migration file to run (e.g. 0002_add_users.sql). Leave empty to apply all pending.
+        required: false
+        type: string
+        default: ""
+
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        type: choice
+        required: true
+        options: [dev, qa]
+      migration_file:
+        description: Specific migration file to run (e.g. 0002_add_users.sql). Leave empty to apply all pending.
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  migrate:
+    name: Migrate (${{ inputs.environment }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Check features FIRST — before any CF calls
+      - name: Check D1 feature flag
+        id: check_d1
+        run: |
+          D1=$(node -e "try{const c=require('./app.config.json');process.stdout.write(String(c.features?.d1===true))}catch{process.stdout.write('false')}")
+          echo "enabled=$D1" >> "$GITHUB_OUTPUT"
+          if [ "$D1" = "true" ]; then
+            echo "D1 is enabled — migrations will run."
+          else
+            echo "D1 is not enabled — skipping all migration steps."
+          fi
+
+      - name: Get CF token
+        if: steps.check_d1.outputs.enabled == 'true'
+        run: |
+          OIDC=$(curl -sSfL \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=cf-token-exchange" \
+            | jq -r '.value')
+
+          TOKEN=$(curl -sf -X POST \
+            -H "Authorization: Bearer $OIDC" \
+            "$CF_TOKEN_EXCHANGE_URL/token" \
+            | jq -r '.token // empty')
+
+          if [ -z "$TOKEN" ]; then
+            echo "Failed to get CF token"
+            exit 1
+          fi
+
+          echo "::add-mask::$TOKEN"
+          echo "CLOUDFLARE_API_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+        env:
+          CF_TOKEN_EXCHANGE_URL: ${{ vars.CF_TOKEN_EXCHANGE_URL }}
+
+      - name: Render Wrangler config
+        if: steps.check_d1.outputs.enabled == 'true'
+        run: node scripts/render-wrangler-config.mjs
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ env.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          BRANCH_NAME: ${{ inputs.environment }}
+          ROOT_DOMAIN: ${{ vars.CLOUDFLARE_ROOT_DOMAIN }}
+
+      - name: List migration status
+        if: steps.check_d1.outputs.enabled == 'true'
+        run: |
+          REPO=$(echo "$GITHUB_REPOSITORY" | cut -d'/' -f2 | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g')
+          DB_NAME="${REPO}-${{ inputs.environment }}"
+
+          echo "── Available migration files ──"
+          ls migrations/*.sql 2>/dev/null | xargs -I{} basename {} || echo "(none)"
+
+          echo ""
+          echo "── Applied / pending ──"
+          npx wrangler d1 migrations list "$DB_NAME" \
+            --remote \
+            --config .wrangler/deploy/wrangler.jsonc || true
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ env.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+      - name: Apply migrations
+        if: steps.check_d1.outputs.enabled == 'true'
+        run: |
+          REPO=$(echo "$GITHUB_REPOSITORY" | cut -d'/' -f2 | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g')
+          DB_NAME="${REPO}-${{ inputs.environment }}"
+          MIGRATION_FILE="${{ inputs.migration_file }}"
+
+          if [ -z "$MIGRATION_FILE" ]; then
+            echo "Applying all pending migrations to: $DB_NAME"
+            npx wrangler d1 migrations apply "$DB_NAME" \
+              --remote \
+              --config .wrangler/deploy/wrangler.jsonc
+          else
+            if [ ! -f "migrations/$MIGRATION_FILE" ]; then
+              echo "Migration file not found: migrations/$MIGRATION_FILE"
+              echo "Available files:"
+              ls migrations/*.sql 2>/dev/null | xargs -I{} basename {} || echo "(none)"
+              exit 1
+            fi
+            echo "Applying single migration: $MIGRATION_FILE → $DB_NAME"
+            npx wrangler d1 execute "$DB_NAME" \
+              --remote \
+              --file "migrations/$MIGRATION_FILE" \
+              --config .wrangler/deploy/wrangler.jsonc
+          fi
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ env.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}

@@ -1,0 +1,102 @@
+name: Rollback Migration
+
+# Manually runs a rollback SQL file against a D1 database.
+# Rollback files live in migrations/rollbacks/.
+# This workflow is intentionally manual-only — never auto-triggered.
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        type: choice
+        required: true
+        options: [dev, qa]
+      rollback_file:
+        description: Rollback file to execute (e.g. 0003_add_posts.sql from migrations/rollbacks/)
+        required: true
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  rollback:
+    name: Rollback (${{ inputs.environment }}) — ${{ inputs.rollback_file }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Get CF token
+        run: |
+          OIDC=$(curl -sSfL \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=cf-token-exchange" \
+            | jq -r '.value')
+
+          TOKEN=$(curl -sf -X POST \
+            -H "Authorization: Bearer $OIDC" \
+            "$CF_TOKEN_EXCHANGE_URL/token" \
+            | jq -r '.token // empty')
+
+          if [ -z "$TOKEN" ]; then
+            echo "Failed to get CF token"
+            exit 1
+          fi
+
+          echo "::add-mask::$TOKEN"
+          echo "CLOUDFLARE_API_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+        env:
+          CF_TOKEN_EXCHANGE_URL: ${{ vars.CF_TOKEN_EXCHANGE_URL }}
+
+      - name: Render Wrangler config
+        run: node scripts/render-wrangler-config.mjs
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ env.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          BRANCH_NAME: ${{ inputs.environment }}
+          ROOT_DOMAIN: ${{ vars.CLOUDFLARE_ROOT_DOMAIN }}
+
+      - name: Validate rollback file exists
+        run: |
+          FILE="migrations/rollbacks/${{ inputs.rollback_file }}"
+          if [ ! -f "$FILE" ]; then
+            echo "Rollback file not found: $FILE"
+            echo ""
+            echo "Available rollback files:"
+            ls migrations/rollbacks/*.sql 2>/dev/null | xargs -I{} basename {} || echo "(none)"
+            exit 1
+          fi
+          echo "Found: $FILE"
+          echo ""
+          echo "── SQL to be executed ──"
+          cat "$FILE"
+
+      - name: Execute rollback
+        run: |
+          REPO=$(echo "$GITHUB_REPOSITORY" | cut -d'/' -f2 | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g')
+          DB_NAME="${REPO}-${{ inputs.environment }}"
+
+          echo "Rolling back: migrations/rollbacks/${{ inputs.rollback_file }} → $DB_NAME"
+          npx wrangler d1 execute "$DB_NAME" \
+            --remote \
+            --file "migrations/rollbacks/${{ inputs.rollback_file }}" \
+            --config .wrangler/deploy/wrangler.jsonc
+
+          echo ""
+          echo "Rollback complete. Current migration status:"
+          npx wrangler d1 migrations list "$DB_NAME" \
+            --remote \
+            --config .wrangler/deploy/wrangler.jsonc || true
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ env.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}

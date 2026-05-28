@@ -1,0 +1,147 @@
+name: Configure Domain
+
+# Called automatically from deploy.yml after a successful Worker deploy.
+# Can also be triggered manually to repair or inspect DNS bindings.
+on:
+  workflow_call:
+    inputs:
+      app_name:
+        description: Cloudflare Worker name (e.g. my-app-dev)
+        required: true
+        type: string
+      app_hostname:
+        description: Full custom hostname (e.g. my-app-dev.apps.example.com)
+        required: true
+        type: string
+      root_domain:
+        description: Root zone domain in Cloudflare (e.g. apps.example.com)
+        required: true
+        type: string
+    secrets:
+      CLOUDFLARE_ACCOUNT_ID:
+        required: true
+      CF_TOKEN_EXCHANGE_URL:
+        required: false
+
+  workflow_dispatch:
+    inputs:
+      app_name:
+        description: Cloudflare Worker name (e.g. my-app-dev)
+        required: true
+        type: string
+      app_hostname:
+        description: Full custom hostname (e.g. my-app-dev.apps.example.com)
+        required: true
+        type: string
+      root_domain:
+        description: Root zone domain in Cloudflare (e.g. apps.example.com)
+        required: true
+        type: string
+
+jobs:
+  configure-domain:
+    name: Attach ${{ inputs.app_hostname }} → ${{ inputs.app_name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Get CF token
+        run: |
+          OIDC=$(curl -sSfL \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=cf-token-exchange" \
+            | jq -r '.value')
+
+          TOKEN=$(curl -sf -X POST \
+            -H "Authorization: Bearer $OIDC" \
+            "$CF_TOKEN_EXCHANGE_URL/token" \
+            | jq -r '.token // empty')
+
+          if [ -z "$TOKEN" ]; then
+            echo "Failed to get CF token — check CF_TOKEN_EXCHANGE_URL and Worker logs"
+            exit 1
+          fi
+
+          echo "::add-mask::$TOKEN"
+          echo "CLOUDFLARE_API_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+        env:
+          CF_TOKEN_EXCHANGE_URL: ${{ vars.CF_TOKEN_EXCHANGE_URL }}
+
+      - name: Resolve Cloudflare Zone ID
+        id: zone
+        run: |
+          ROOT_DOMAIN="${{ inputs.root_domain }}"
+          RESPONSE=$(curl -sf \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/zones?name=${ROOT_DOMAIN}")
+
+          SUCCESS=$(echo "$RESPONSE" | jq -r '.success // false')
+          if [ "$SUCCESS" != "true" ]; then
+            echo "Failed to query zones API."
+            echo "$RESPONSE" | jq .
+            exit 1
+          fi
+
+          ZONE_ID=$(echo "$RESPONSE" | jq -r '.result[0].id // empty')
+          if [ -z "$ZONE_ID" ]; then
+            echo "No Cloudflare zone found for domain: ${ROOT_DOMAIN}"
+            echo "Ensure the root domain exists as a zone in your Cloudflare account."
+            exit 1
+          fi
+
+          echo "zone_id=${ZONE_ID}" >> "$GITHUB_OUTPUT"
+          echo "Zone ID: ${ZONE_ID}"
+
+      - name: Attach custom domain to Worker
+        run: |
+          ACCOUNT_ID="${{ secrets.CLOUDFLARE_ACCOUNT_ID }}"
+          ZONE_ID="${{ steps.zone.outputs.zone_id }}"
+          WORKER="${{ inputs.app_name }}"
+          HOSTNAME="${{ inputs.app_hostname }}"
+
+          PAYLOAD=$(jq -cn \
+            --arg hostname "$HOSTNAME" \
+            --arg service "$WORKER" \
+            --arg zone_id "$ZONE_ID" \
+            '{hostname: $hostname, service: $service, environment: "production", zone_id: $zone_id}')
+
+          RESPONSE=$(curl -sf -X PUT \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            "https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/workers/domains")
+
+          SUCCESS=$(echo "$RESPONSE" | jq -r '.success // false')
+          if [ "$SUCCESS" != "true" ]; then
+            echo "Failed to attach custom domain."
+            echo "$RESPONSE" | jq .
+            exit 1
+          fi
+
+          echo "Custom domain configured: https://${HOSTNAME}"
+
+      - name: Verify DNS record exists
+        continue-on-error: true
+        run: |
+          ZONE_ID="${{ steps.zone.outputs.zone_id }}"
+          HOSTNAME="${{ inputs.app_hostname }}"
+
+          RESPONSE=$(curl -s \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records?name=${HOSTNAME}")
+
+          SUCCESS=$(echo "$RESPONSE" | jq -r '.success // false')
+          if [ "$SUCCESS" != "true" ]; then
+            echo "Note: DNS record lookup skipped (token may lack DNS Read permission)."
+            exit 0
+          fi
+
+          COUNT=$(echo "$RESPONSE" | jq '.result | length')
+          if [ "$COUNT" -gt 0 ]; then
+            echo "DNS record confirmed for ${HOSTNAME}."
+          else
+            echo "Note: DNS record not yet visible — Cloudflare may take a moment to propagate the Workers Domain binding."
+          fi

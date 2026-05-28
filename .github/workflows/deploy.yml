@@ -1,0 +1,155 @@
+name: Deploy
+
+on:
+  push:
+    branches: [dev, qa]
+  workflow_dispatch:
+
+# id-token: write is required so every job can request an OIDC token
+# and exchange it for a CF API token via the token-exchange Worker.
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  # ── 1. Run D1 migrations before deploying code ───────────────────────────
+  migrate:
+    name: Migrate (${{ github.ref_name }})
+    uses: ./.github/workflows/migrate.yml
+    with:
+      environment: ${{ github.ref_name }}
+      migration_file: ""
+    secrets: inherit
+
+  # ── 2. Deploy Worker after migrations succeed ─────────────────────────────
+  deploy:
+    name: Deploy (${{ github.ref_name }})
+    needs: migrate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      BRANCH_NAME: ${{ github.ref_name }}
+      ROOT_DOMAIN: ${{ vars.CLOUDFLARE_ROOT_DOMAIN }}
+    outputs:
+      app_name: ${{ steps.render_config.outputs.app_name }}
+      app_hostname: ${{ steps.render_config.outputs.app_hostname }}
+      branch: ${{ steps.render_config.outputs.branch }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Get CF token
+        run: |
+          OIDC=$(curl -sSfL \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=cf-token-exchange" \
+            | jq -r '.value')
+
+          TOKEN=$(curl -sf -X POST \
+            -H "Authorization: Bearer $OIDC" \
+            "$CF_TOKEN_EXCHANGE_URL/token" \
+            | jq -r '.token // empty')
+
+          if [ -z "$TOKEN" ]; then
+            echo "Failed to get CF token — check CF_TOKEN_EXCHANGE_URL variable and Worker logs"
+            exit 1
+          fi
+
+          echo "::add-mask::$TOKEN"
+          echo "CLOUDFLARE_API_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+        env:
+          CF_TOKEN_EXCHANGE_URL: ${{ vars.CF_TOKEN_EXCHANGE_URL }}
+
+      - name: Type check
+        run: npm run type-check
+
+      - name: Render Wrangler config
+        id: render_config
+        run: node scripts/render-wrangler-config.mjs
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ env.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+      - name: Verify Cloudflare API token
+        run: |
+          result=$(curl -sf \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/user/tokens/verify")
+          status=$(echo "$result" | jq -r '.result.status // "invalid"')
+          if [ "$status" != "active" ]; then
+            echo "Cloudflare token is invalid or expired."
+            echo "$result" | jq .
+            exit 1
+          fi
+          echo "Token active."
+
+      - name: Deploy Worker
+        run: npx wrangler deploy --config .wrangler/deploy/wrangler.jsonc
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ env.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+  # ── 2. Attach custom domain via Cloudflare Workers Domains API ───────────
+  domain:
+    name: Configure Domain (${{ needs.deploy.outputs.app_hostname }})
+    needs: deploy
+    uses: ./.github/workflows/domain.yml
+    with:
+      app_name: ${{ needs.deploy.outputs.app_name }}
+      app_hostname: ${{ needs.deploy.outputs.app_hostname }}
+      root_domain: ${{ vars.CLOUDFLARE_ROOT_DOMAIN }}
+    secrets: inherit
+
+  # ── 3. Create / update Cloudflare Access application ─────────────────────
+  access:
+    name: Sync Access App (${{ needs.deploy.outputs.app_hostname }})
+    needs: deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Get CF token
+        run: |
+          OIDC=$(curl -sSfL \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=cf-token-exchange" \
+            | jq -r '.value')
+
+          TOKEN=$(curl -sf -X POST \
+            -H "Authorization: Bearer $OIDC" \
+            "$CF_TOKEN_EXCHANGE_URL/token" \
+            | jq -r '.token // empty')
+
+          if [ -z "$TOKEN" ]; then
+            echo "Failed to get CF token — check CF_TOKEN_EXCHANGE_URL variable and Worker logs"
+            exit 1
+          fi
+
+          echo "::add-mask::$TOKEN"
+          echo "CLOUDFLARE_API_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+        env:
+          CF_TOKEN_EXCHANGE_URL: ${{ vars.CF_TOKEN_EXCHANGE_URL }}
+
+      - name: Sync Access app
+        run: node ./scripts/sync-access.mjs
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ env.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          APP_NAME: ${{ needs.deploy.outputs.app_name }}
+          APP_HOSTNAME: ${{ needs.deploy.outputs.app_hostname }}
+          CLOUDFLARE_ACCESS_POLICY_ID: ${{ vars.CLOUDFLARE_ACCESS_POLICY_ID }}
+          ACCESS_SESSION_DURATION: ${{ vars.CLOUDFLARE_ACCESS_SESSION_DURATION || '24h' }}

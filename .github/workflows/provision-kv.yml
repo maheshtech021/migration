@@ -1,0 +1,73 @@
+name: Provision KV
+
+# Triggered by the self-service portal when a user enables KV.
+# Creates {reponame}-dev and {reponame}-qa namespaces if they don't already exist.
+# Idempotent — safe to re-run at any time.
+on:
+  workflow_dispatch:
+
+jobs:
+  provision:
+    name: Provision KV Namespaces (dev + qa)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    steps:
+      - name: Provision namespaces
+        run: |
+          REPO_RAW="${GITHUB_REPOSITORY##*/}"
+          REPO=$(echo "$REPO_RAW" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/-+/-/g; s/^-|-$//g')
+
+          for ENV in dev qa; do
+            NAME="${REPO}-${ENV}"
+            echo "── $NAME ──"
+
+            # Search by title — CF KV API has no name filter, so paginate
+            EXISTING_ID=""
+            CURSOR=""
+            while true; do
+              URL="https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/storage/kv/namespaces?per_page=100"
+              [ -n "$CURSOR" ] && URL="${URL}&cursor=${CURSOR}"
+
+              RESPONSE=$(curl -s \
+                -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+                "$URL")
+
+              SUCCESS=$(echo "$RESPONSE" | jq -r '.success // false')
+              if [ "$SUCCESS" != "true" ]; then
+                echo "CF API error while listing KV namespaces:"
+                echo "$RESPONSE" | jq .
+                exit 1
+              fi
+
+              EXISTING_ID=$(echo "$RESPONSE" | jq -r --arg n "$NAME" '.result[] | select(.title == $n) | .id' | head -1)
+              [ -n "$EXISTING_ID" ] && break
+
+              CURSOR=$(echo "$RESPONSE" | jq -r '.result_info.cursor // empty')
+              [ -z "$CURSOR" ] && break
+            done
+
+            if [ -n "$EXISTING_ID" ]; then
+              echo "Already exists: ${NAME} (${EXISTING_ID})"
+              continue
+            fi
+
+            RESPONSE=$(curl -s -X POST \
+              -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "{\"title\": \"${NAME}\"}" \
+              "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/storage/kv/namespaces")
+
+            ID=$(echo "$RESPONSE" | jq -r '.result.id // empty')
+            if [ -z "$ID" ]; then
+              echo "Failed to create: ${NAME}"
+              echo "$RESPONSE" | jq .
+              exit 1
+            fi
+            echo "Created: ${NAME} (${ID})"
+          done
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}

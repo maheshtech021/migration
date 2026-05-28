@@ -1,0 +1,61 @@
+name: Provision R2
+
+# Triggered by the self-service portal when a user enables R2.
+# Creates {reponame}-dev and {reponame}-qa buckets if they don't already exist.
+# Idempotent — safe to re-run at any time.
+on:
+  workflow_dispatch:
+
+jobs:
+  provision:
+    name: Provision R2 Buckets (dev + qa)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    steps:
+      - name: Provision buckets
+        run: |
+          REPO_RAW="${GITHUB_REPOSITORY##*/}"
+          REPO=$(echo "$REPO_RAW" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/-+/-/g; s/^-|-$//g')
+
+          for ENV in dev qa; do
+            NAME="${REPO}-${ENV}"
+            echo "── $NAME ──"
+
+            RESPONSE=$(curl -s \
+              -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/r2/buckets/${NAME}")
+
+            SUCCESS=$(echo "$RESPONSE" | jq -r '.success // false')
+            if [ "$SUCCESS" = "true" ]; then
+              echo "Already exists: ${NAME}"
+              continue
+            fi
+
+            # error code 10006 = "bucket not found" — expected when creating for first time
+            ERROR_CODE=$(echo "$RESPONSE" | jq -r '.errors[0].code // empty')
+            if [ -n "$ERROR_CODE" ] && [ "$ERROR_CODE" != "10006" ]; then
+              echo "CF API error while checking for ${NAME}:"
+              echo "$RESPONSE" | jq .
+              exit 1
+            fi
+
+            RESPONSE=$(curl -s -X PUT \
+              -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "{\"name\": \"${NAME}\"}" \
+              "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/r2/buckets")
+
+            SUCCESS=$(echo "$RESPONSE" | jq -r '.success // false')
+            if [ "$SUCCESS" != "true" ]; then
+              echo "Failed to create: ${NAME}"
+              echo "$RESPONSE" | jq .
+              exit 1
+            fi
+            echo "Created: ${NAME}"
+          done
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}

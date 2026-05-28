@@ -1,0 +1,86 @@
+{
+  // Cloudflare Workers configuration
+  // Docs: https://developers.cloudflare.com/workers/wrangler/configuration/
+  //
+  // HOW TO USE THIS TEMPLATE
+  // ─────────────────────────
+  // 1. Replace every <placeholder> with your actual values.
+  // 2. Uncomment the binding sections you need (D1, KV, R2, Queues).
+  // 3. Set secrets via CLI — never paste them here:
+  //      wrangler secret put JWT_SECRET
+  //      wrangler secret put ALLOWED_ORIGIN
+  // 4. Deploy: wrangler deploy
+  //
+  // For detailed setup steps for each service, see docs/cloudflare-setup.md
+
+  // ─── Core ───────────────────────────────────────────────────────────────────
+
+  "name": "<your-app-name>",             // e.g. "my-api"
+  "main": "src/index.ts",
+  "compatibility_date": "2024-11-01",
+  "workers_dev": false,              // disable *.workers.dev — custom domain only
+
+  "observability": {
+    "enabled": true                       // enables Workers Logs in the dashboard
+  },
+
+  // ─── D1 Database ────────────────────────────────────────────────────────────
+  // Uncomment when you have a D1 database.
+  // Create one with: wrangler d1 create <name>
+  // Setup guide: docs/cloudflare-setup.md#d1-database
+  //
+  // "d1_databases": [
+  //   {
+  //     "binding": "DB",                 // accessed as c.env.DB in code
+  //     "database_name": "<your-database-name>",
+  //     "database_id": "<paste id from wrangler d1 create>",
+  //     "migrations_dir": "migrations"
+  //   }
+  // ],
+
+  // ─── KV Namespace ───────────────────────────────────────────────────────────
+  // Uncomment for caching, sessions, or simple key-value storage.
+  // Create with: wrangler kv namespace create <NAME>
+  // Setup guide: docs/cloudflare-setup.md#kv-namespace
+  //
+  // "kv_namespaces": [
+  //   {
+  //     "binding": "KV",                 // accessed as c.env.KV in code
+  //     "id": "<prod namespace id>",
+  //     "preview_id": "<preview namespace id>"
+  //   }
+  // ],
+
+  // ─── R2 Bucket ──────────────────────────────────────────────────────────────
+  // Uncomment for file / object storage.
+  // Create with: wrangler r2 bucket create <name>
+  // Setup guide: docs/cloudflare-setup.md#r2-object-storage
+  //
+  // "r2_buckets": [
+  //   {
+  //     "binding": "BUCKET",             // accessed as c.env.BUCKET in code
+  //     "bucket_name": "<your-bucket-name>"
+  //   }
+  // ],
+
+  // ─── Queues ─────────────────────────────────────────────────────────────────
+  // Uncomment for background jobs or event-driven processing.
+  // Create with: wrangler queues create <name>
+  // Setup guide: docs/cloudflare-setup.md#queues
+  //
+  // "queues": {
+  //   "producers": [
+  //     {
+  //       "binding": "QUEUE",            // accessed as c.env.QUEUE in code
+  //       "queue": "<your-queue-name>"
+  //     }
+  //   ],
+  //   "consumers": [
+  //     {
+  //       "queue": "<your-queue-name>",
+  //       "max_batch_size": 10,
+  //       "max_batch_timeout": 5
+  //     }
+  //   ]
+  // }
+}

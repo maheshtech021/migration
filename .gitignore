@@ -1,0 +1,6 @@
+node_modules/
+.wrangler/
+dist/
+
+# Local secrets — copy from .dev.vars.example, never commit the real one
+.dev.vars

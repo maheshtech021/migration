@@ -1,0 +1,60 @@
+name: Provision D1
+
+# Triggered by the self-service portal when a user enables D1.
+# Creates {reponame}-dev and {reponame}-qa databases if they don't already exist.
+# Idempotent — safe to re-run at any time.
+on:
+  workflow_dispatch:
+
+jobs:
+  provision:
+    name: Provision D1 Databases (dev + qa)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    steps:
+      - name: Provision databases
+        run: |
+          REPO_RAW="${GITHUB_REPOSITORY##*/}"
+          REPO=$(echo "$REPO_RAW" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/-+/-/g; s/^-|-$//g')
+
+          for ENV in dev qa; do
+            NAME="${REPO}-${ENV}"
+            echo "── $NAME ──"
+
+            RESPONSE=$(curl -s \
+              -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/d1/database?name=${NAME}")
+
+            SUCCESS=$(echo "$RESPONSE" | jq -r '.success // false')
+            if [ "$SUCCESS" != "true" ]; then
+              echo "CF API error while checking for ${NAME}:"
+              echo "$RESPONSE" | jq .
+              exit 1
+            fi
+
+            EXISTING=$(echo "$RESPONSE" | jq -r '.result[0].uuid // empty')
+            if [ -n "$EXISTING" ]; then
+              echo "Already exists: ${NAME} (${EXISTING})"
+              continue
+            fi
+
+            RESPONSE=$(curl -s -X POST \
+              -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "{\"name\": \"${NAME}\"}" \
+              "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/d1/database")
+
+            ID=$(echo "$RESPONSE" | jq -r '.result.uuid // empty')
+            if [ -z "$ID" ]; then
+              echo "Failed to create: ${NAME}"
+              echo "$RESPONSE" | jq .
+              exit 1
+            fi
+            echo "Created: ${NAME} (${ID})"
+          done
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}

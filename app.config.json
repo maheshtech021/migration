@@ -1,0 +1,8 @@
+{
+  "features": {
+    "d1": false,
+    "kv": false,
+    "r2": false,
+    "queues": false
+  }
+}
